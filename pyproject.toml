@@ -1,0 +1,21 @@
+[project]
+name = "your-ml-repo"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "axiom",
+    "flax",
+    "optax",
+    "orbax-checkpoint",
+    "datasets>=2.18.0",
+    "gcsfs>=2024.2.0",
+    "numpy",
+    "wandb"
+]
+
+[tool.uv.sources]
+axiom = { git = "https://github.com/Adam-Jacuch/Axiom.git" }
+
+[dependency-groups]
+local = ["jax[cpu]"]
+tpu = ["jax[tpu]"]
