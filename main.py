@@ -63,10 +63,10 @@ def main():
     # Axiom only uses the batch/seq length for execution, but calculates all
     # parameter shapes based on the feature dimensions (which are already known).
     dummy_batch = jnp.ones((GLOBAL_BATCH_SIZE, 16), dtype=jnp.int32)
-    dummy_tensor = tensor(dummy_batch, ax_b, ax.sq).apply_sharding()
 
-    # Run the dummy pass to spawn the weights!
-    _ = model(dummy_tensor, use_checkpointing=False)
+    with mesh:
+        dummy_tensor = tensor(dummy_batch, ax_b, ax.sq).apply_sharding()
+        _ = model(dummy_tensor)
 
     # NOW initialize the optimizer! Because the model has weights now,
     # the optimizer will trace them perfectly.
