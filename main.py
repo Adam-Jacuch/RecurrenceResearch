@@ -62,7 +62,7 @@ def main():
         alpha=0.1
     )
     tx = optax.adamw(learning_rate=schedule, b1=0.9, b2=0.95, weight_decay=1e-1)
-    optimizer = nnx.Optimizer(model, tx)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     # 4. Setup Orbax Checkpoint Manager (Tracking 'step' for W&B syncing)
     options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
