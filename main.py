@@ -96,8 +96,8 @@ def main():
         batch_tensor = tensor(batch_global, ax_b, ax.sq).apply_sharding()
 
         # Autoregressive shift
-        inputs = batch_tensor[..., :-1]
-        targets = batch_tensor[..., 1:]
+        inputs = batch_tensor[..., ax.sq[:-1]]
+        targets = batch_tensor[..., ax.sq[1:]]
 
         def loss_fn(state_):
             model_ = nnx.merge(graphdef, state_)
