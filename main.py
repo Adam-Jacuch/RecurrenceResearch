@@ -122,8 +122,8 @@ def main():
         batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
         batch_tensor = tensor(batch_global, ax_b, ax.sq).apply_sharding()
 
-        inputs = batch_tensor[..., :-1]
-        targets = batch_tensor[..., 1:]
+        inputs = batch_tensor[..., ax.sq[:-1]]
+        targets = batch_tensor[..., ax.sq[1:]]
 
         model_ = nnx.merge(graphdef, state)
         logits = model_(inputs)

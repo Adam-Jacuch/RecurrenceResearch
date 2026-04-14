@@ -1,16 +1,16 @@
 [project]
 name = "your-ml-repo"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "axiom",
-    "flax",
+    "flax>=0.12.4",
     "optax",
     "orbax-checkpoint",
     "datasets>=2.18.0",
     "gcsfs>=2024.2.0",
     "numpy",
-    "wandb"
+    "wandb",
 ]
 
 [tool.uv.sources]

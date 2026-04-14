@@ -11,13 +11,16 @@ class Recurrence(Module):
         return x[..., ax.sq.assoc_scan(fn=linear_combine, inputs=(alpha,)), ax.d]
 
 class Step(Module):
-    def __init__(self):
+    def __init__(self, step_idx: int = 0):
+        self.step_idx = step_idx
         self.rec = Recurrence()
 
     def __call__(self, v, ctx, out, alpha_logits):
         ctx_norm = ctx[..., ax.d.norm_rms()]
 
-        step_logits = ctx_norm[..., ax.d.proj(bias_init=init.linspace(-2.0, 6.5))]
+        bias_init = init.linspace(-2.0, 6.5) if self.step_idx == 0 else init.zeros
+
+        step_logits = ctx_norm[..., ax.d.proj(bias_init=bias_init)]
         alpha_logits = alpha_logits + step_logits
         alphas = alpha_logits[..., ax.d.sigmoid()]
 
@@ -26,8 +29,7 @@ class Step(Module):
 
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        v = v + fetched[..., ax.d.proj().silu()]
-        ctx = ctx + fetched[..., ax.d.proj().silu()]
+        ctx = ctx + fetched[..., ax.d.proj(kernel_init=init.zeros).silu()]
         out = out + fetched
 
         return v, ctx, out, alpha_logits
@@ -35,7 +37,7 @@ class Step(Module):
 class Block(Module):
     def __init__(self, N: int) -> None:
         self.N = N
-        self.steps = nnx.List(Step() for _ in range(N))
+        self.steps = nnx.List(Step(step_idx=i) for i in range(N))
 
     def __call__(self, x):
         c = x[..., ax.d.conv(4, over=ax.sq.causal(), groups="depthwise").silu()]
