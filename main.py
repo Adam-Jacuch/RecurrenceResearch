@@ -53,9 +53,23 @@ def main():
     mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape((device_count,)), ('data',))
     ax_b = ax.b(GLOBAL_BATCH_SIZE).shard("data")
 
-    # 3. Initialize Model & Optimizer
+    # 3. Initialize Model
     model = Model(vocab=VOCAB_SIZE, dim=DIM, depth=DEPTH, N=N_STEPS, dropout=0.0)
 
+    # --- THE FIX: DUMMY FORWARD PASS TO MATERIALIZE AXIOM WEIGHTS ---
+    print("Materializing Axiom dynamic parameters...")
+
+    # We create a tiny fake batch to push through the network.
+    # Axiom only uses the batch/seq length for execution, but calculates all
+    # parameter shapes based on the feature dimensions (which are already known).
+    dummy_batch = jnp.ones((GLOBAL_BATCH_SIZE, 16), dtype=jnp.int32)
+    dummy_tensor = tensor(dummy_batch, ax_b, ax.sq).apply_sharding()
+
+    # Run the dummy pass to spawn the weights!
+    _ = model(dummy_tensor, use_checkpointing=False)
+
+    # NOW initialize the optimizer! Because the model has weights now,
+    # the optimizer will trace them perfectly.
     schedule = optax.cosine_decay_schedule(
         init_value=LEARNING_RATE,
         decay_steps=MAX_STEPS,
@@ -64,7 +78,7 @@ def main():
     tx = optax.adamw(learning_rate=schedule, b1=0.9, b2=0.95, weight_decay=1e-1)
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
-    # --- THE FIX: Split model and optimizer TOGETHER so references are preserved! ---
+    # Split them together
     graphdef, state = nnx.split((model, optimizer))
 
     # 4. Setup Orbax Checkpoint Manager
