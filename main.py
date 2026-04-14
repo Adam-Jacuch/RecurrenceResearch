@@ -111,7 +111,7 @@ def main():
         loss, grads = nnx.value_and_grad(loss_fn)(model_)
 
         # This naturally mutates BOTH optimizer_ and model_ in-place!
-        optimizer_.update(grads)
+        optimizer_.update(model_, grads)
 
         # Re-pack the updated state together
         new_state = nnx.state((model_, optimizer_))
