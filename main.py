@@ -64,11 +64,14 @@ def main():
     tx = optax.adamw(learning_rate=schedule, b1=0.9, b2=0.95, weight_decay=1e-1)
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
-    # 4. Setup Orbax Checkpoint Manager (Tracking 'step' for W&B syncing)
+    # --- THE FIX: Split model and optimizer TOGETHER so references are preserved! ---
+    graphdef, state = nnx.split((model, optimizer))
+
+    # 4. Setup Orbax Checkpoint Manager
     options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
     mngr = ocp.CheckpointManager(
         os.path.abspath(GCS_CHECKPOINT_DIR),
-        item_names=('model', 'optimizer', 'step'),  # Added step tracking
+        item_names=('model', 'optimizer', 'step'),
         options=options
     )
 
@@ -85,38 +88,36 @@ def main():
             )
         )
         start_step = mngr.latest_step()
+        # CRITICAL: Re-split after restoring so the loop gets the updated state!
+        graphdef, state = nnx.split((model, optimizer))
 
-    # 6. Define the GSPMD Training Step (NO pmap!)
+    # 6. Define the GSPMD Training Step (The Pure NNX Way)
     @jax.jit
-    def train_step(graphdef, state, opt_state, batch_np):
-        # The loader yields (devices, local_batch, seq). Flatten to global for GSPMD.
+    def train_step(graphdef, state, batch_np):
         batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
-
-        # Wrap in AxiomTensor and apply hardware constraints
         batch_tensor = tensor(batch_global, ax_b, ax.sq).apply_sharding()
 
-        # Autoregressive shift
         inputs = batch_tensor[..., ax.sq[:-1]]
         targets = batch_tensor[..., ax.sq[1:]]
 
-        def loss_fn(state_):
-            model_ = nnx.merge(graphdef, state_)
+        # Reconstruct BOTH the model and optimizer inside the JIT boundary
+        model_, optimizer_ = nnx.merge(graphdef, state)
 
-            # Forward pass inherently respects the semantic sharding
-            logits = model_(inputs).apply_sharding()
+        def loss_fn(m):
+            logits = m(inputs).apply_sharding()
+            return optax.softmax_cross_entropy_with_integer_labels(logits.data, targets.data).mean()
 
-            loss = optax.softmax_cross_entropy_with_integer_labels(logits.data, targets.data).mean()
-            return loss, model_
+        # Calculate gradients using the model reference
+        loss, grads = nnx.value_and_grad(loss_fn)(model_)
 
-        # Calculate & Apply gradients
-        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-        (loss, model_), grads = grad_fn(state)
-        opt_state_ = optimizer.update(opt_state, grads)
+        # This naturally mutates BOTH optimizer_ and model_ in-place!
+        optimizer_.update(grads)
 
-        new_graphdef, new_state = nnx.split(model_)
-        return new_state, opt_state_, loss
+        # Re-pack the updated state together
+        new_state = nnx.state((model_, optimizer_))
+        return new_state, loss
 
-    # 7. Define Validation Step (For NeurIPS generalization proof)
+    # 7. Define Validation Step
     @jax.jit
     def val_step(graphdef, state, batch_np):
         batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
@@ -125,44 +126,36 @@ def main():
         inputs = batch_tensor[..., ax.sq[:-1]]
         targets = batch_tensor[..., ax.sq[1:]]
 
-        model_ = nnx.merge(graphdef, state)
+        # We only need the model for validation
+        model_, _ = nnx.merge(graphdef, state)
         logits = model_(inputs)
         return optax.softmax_cross_entropy_with_integer_labels(logits.data, targets.data).mean()
-
-    # Extract initial state
-    graphdef, state = nnx.split(model)
-    opt_state = nnx.split(optimizer)[1]
 
     # 8. Initialize Dataloaders
     train_loader = DistributedTPULoader(DATASET_PATH, GLOBAL_BATCH_SIZE)
     # val_loader = DistributedTPULoader(VAL_DATASET_PATH, GLOBAL_BATCH_SIZE)
 
-    # 9. The Training Loop (Executed within the Mesh context)
+    # 9. The Training Loop
     print("Beginning training loop...")
     with mesh:
         for step, batch in enumerate(train_loader, start=start_step):
             if step >= MAX_STEPS:
                 break
 
-            state, opt_state, loss = train_step(graphdef, state, opt_state, batch["input_ids"])
+            # Now we only pass the single unified state!
+            state, loss = train_step(graphdef, state, batch["input_ids"])
 
             # Logging
             if step % 10 == 0:
                 print(f"Step {step} | Train Loss: {loss.item():.4f}")
                 run.log({"train/loss": loss.item(), "step": step})
 
-            # Validation & Asynchronous checkpointing
+            # Checkpointing
             if step % SAVE_INTERVAL == 0 and step > start_step:
                 print(f"Running evaluation & saving checkpoint to GCS at step {step}...")
 
-                # --- Quick Val Loop (Uncomment when val_loader is ready) ---
-                # val_losses = [val_step(graphdef, state, next(val_loader)["input_ids"]).item() for _ in range(10)]
-                # val_loss_mean = np.mean(val_losses)
-                # print(f"Step {step} | Val Loss: {val_loss_mean:.4f}")
-                # run.log({"val/loss": val_loss_mean, "step": step})
-
-                current_model = nnx.merge(graphdef, state)
-                current_opt = nnx.merge(optimizer.graphdef, opt_state)
+                # Merge back to save out
+                current_model, current_opt = nnx.merge(graphdef, state)
 
                 mngr.save(
                     step,
