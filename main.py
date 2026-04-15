@@ -118,7 +118,7 @@ def main():
         model_, optimizer_ = nnx.merge(graphdef, state)
 
         def loss_fn(m):
-            logits = m(inputs).apply_sharding()
+            logits = m(inputs, use_checkpointing=True).apply_sharding()
             return optax.softmax_cross_entropy_with_integer_labels(logits.data, targets.data).mean()
 
         # Calculate gradients using the model reference
