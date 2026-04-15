@@ -84,7 +84,7 @@ def main():
     # 4. Setup Orbax Checkpoint Manager
     options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
     mngr = ocp.CheckpointManager(
-        os.path.abspath(GCS_CHECKPOINT_DIR),
+        GCS_CHECKPOINT_DIR,
         item_names=('model', 'optimizer', 'step'),
         options=options
     )
