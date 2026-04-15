@@ -161,7 +161,8 @@ def main():
     dummy_full_batch = jnp.ones((GLOBAL_BATCH_SIZE, 4096), dtype=jnp.int32)
 
     # Lower the function to XLA and calculate exact mathematical cost
-    lowered = train_step.lower(graphdef, state, dummy_full_batch)
+    with mesh:
+        lowered = train_step.lower(graphdef, state, dummy_full_batch)
     cost_analysis = lowered.cost_analysis()
 
     # Extract total FLOPs per step
