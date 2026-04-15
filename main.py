@@ -16,8 +16,6 @@ from model import Model  # Your Axiom ResLM model
 
 # --- Configuration ---
 GCS_CHECKPOINT_DIR = "gs://adam-axiom-storage/checkpoints/reslm-180m"
-#DATASET_PATH = "gs://adam-axiom-storage/datasets/fineweb-edu-mistral-4096"
-#VAL_DATASET_PATH = "gs://adam-axiom-storage/datasets/fineweb-edu-val-4096"  # For NeurIPS eval
 
 # Path defaults to /home/adam/datasets/... on the TPU Pod
 DATASET_PATH = "/home/adam/datasets/fineweb-edu-mistral-4096"
@@ -156,23 +154,6 @@ def main():
         logits = model_(inputs, use_checkpointing=True)
         return optax.softmax_cross_entropy_with_integer_labels(logits.data, targets.data).mean()
 
-    # --- THEORETICAL FLOPs CALCULATOR ---
-    print("Calculating theoretical hardware metrics via XLA HLO Cost Analysis...")
-    dummy_full_batch = jnp.ones((GLOBAL_BATCH_SIZE, 4096), dtype=jnp.int32)
-
-    # Lower the function to XLA and calculate exact mathematical cost
-    with mesh:
-        lowered = train_step.lower(graphdef, state, dummy_full_batch)
-    cost_analysis = lowered.cost_analysis()
-
-    # Extract total FLOPs per step
-    flops_per_step = cost_analysis.get('flops', 0)
-    tflops_per_step = flops_per_step / 1e12  # Convert to TFLOPs
-    print(f"Mathematical Cost: {tflops_per_step:.4f} TFLOPs per step")
-
-    # Log it as a static config value for the paper
-    run.config.update({"theoretical_tflops_per_step": tflops_per_step})
-
     # 8. Initialize Dataloaders
     train_loader = DistributedTPULoader(DATASET_PATH, GLOBAL_BATCH_SIZE)
     val_loader = DistributedTPULoader(VAL_DATASET_PATH, GLOBAL_BATCH_SIZE)
@@ -192,9 +173,7 @@ def main():
                 print(f"Step {step} | Train Loss: {loss.item():.4f}")
                 run.log({
                     "train/loss": loss.item(),
-                    "step": step,
-                    # We can log cumulative FLOPs to show total compute scaling
-                    "cumulative_tflops": tflops_per_step * step
+                    "step": step
                 })
 
             # Checkpointing & Validation
