@@ -16,8 +16,12 @@ from model import Model  # Your Axiom ResLM model
 
 # --- Configuration ---
 GCS_CHECKPOINT_DIR = "gs://adam-axiom-storage/checkpoints/reslm-180m"
-DATASET_PATH = "gs://adam-axiom-storage/datasets/fineweb-edu-mistral-4096"
-VAL_DATASET_PATH = "gs://adam-axiom-storage/datasets/fineweb-edu-val-4096"  # For NeurIPS eval
+#DATASET_PATH = "gs://adam-axiom-storage/datasets/fineweb-edu-mistral-4096"
+#VAL_DATASET_PATH = "gs://adam-axiom-storage/datasets/fineweb-edu-val-4096"  # For NeurIPS eval
+
+# Path defaults to /home/adam/datasets/... on the TPU Pod
+DATASET_PATH = "/home/adam/datasets/fineweb-edu-mistral-4096"
+VAL_DATASET_PATH = "/home/adam/datasets/fineweb-edu-val-4096"
 
 # 180M Parameter Config
 VOCAB_SIZE = 32000
