@@ -178,6 +178,16 @@ def main():
     train_loader = DistributedTPULoader(DATASET_PATH, GLOBAL_BATCH_SIZE)
     val_loader = DistributedTPULoader(VAL_DATASET_PATH, GLOBAL_BATCH_SIZE)
 
+    # --- THE DATALOADER FIX ---
+    train_iterator = iter(train_loader)
+
+    if start_step > 0:
+        print(f"Fast-forwarding dataloader by {start_step} batches to prevent Adam Shock... This may take a moment.",
+              flush=True)
+        # Consume and discard the batches we already trained on
+        for _ in range(start_step):
+            next(train_iterator)
+
     # 9. The Training Loop
     print("Beginning training loop...")
     with mesh:
