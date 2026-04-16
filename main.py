@@ -100,46 +100,39 @@ def main():
     if not args.reset and mngr.latest_step() is not None:
         print(f"Found existing checkpoint at step {mngr.latest_step()}. Resuming...")
 
-        with mesh:
-            # 1. Capture pristine state to steal its perfect 8-core sharding layouts
-            pristine_model_state = nnx.state(model)
-            pristine_opt_state = nnx.state(optimizer)
+        # 1. Let Orbax load the raw arrays (they will default to Core 0)
+        empty_model_state = nnx.state(model)
+        empty_opt_state = nnx.state(optimizer)
 
-            # 2. Let Orbax load the raw data (which will incorrectly cram everything on Core 0)
-            restored = mngr.restore(
-                mngr.latest_step(),
-                args=ocp.args.Composite(
-                    model=ocp.args.StandardRestore(pristine_model_state),
-                    optimizer=ocp.args.StandardRestore(pristine_opt_state),
-                    step=ocp.args.JsonRestore()
-                )
+        restored = mngr.restore(
+            mngr.latest_step(),
+            args=ocp.args.Composite(
+                model=ocp.args.StandardRestore(empty_model_state),
+                optimizer=ocp.args.StandardRestore(empty_opt_state),
+                step=ocp.args.JsonRestore()
             )
+        )
 
-            # 3. THE UNIVERSAL SHARDING ENFORCER
+        start_step = restored['step']
+
+        # 2. Inject the loaded arrays into NNX
+        nnx.update(model, restored['model'])
+        nnx.update(optimizer, restored['optimizer'])
+
+        # 3. Re-split to get the unified training state
+        graphdef, state = nnx.split((model, optimizer))
+
+        # 4. THE ULTIMATE SHARDING FIX
+        # Bruteforce REPLICATE every single parameter, optimizer buffer, and RNG key across all 8 cores!
+        with mesh:
             replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-            def enforce_sharding(restored_leaf, pristine_leaf):
-                if isinstance(pristine_leaf, jax.Array):
-                    # THE SCALAR FIX: If it's a 0D PRNG key, force 8-core replication
-                    if pristine_leaf.ndim == 0:
-                        return jax.device_put(restored_leaf, replicated_sharding)
-                    # THE WEIGHT FIX: If it's a massive matrix, copy the exact Axiom sharding rule
-                    elif hasattr(pristine_leaf, 'sharding'):
-                        return jax.device_put(restored_leaf, pristine_leaf.sharding)
-                return restored_leaf
+            def replicate_all(x):
+                if isinstance(x, jax.Array):
+                    return jax.device_put(x, replicated_sharding)
+                return x
 
-            # Bruteforce the correct shardings onto both the model and the optimizer
-            restored_model_sharded = jax.tree.map(enforce_sharding, restored['model'], pristine_model_state)
-            restored_opt_sharded = jax.tree.map(enforce_sharding, restored['optimizer'], pristine_opt_state)
-
-            # 4. Inject the correctly sharded arrays back into our stateful NNX objects
-            nnx.update(model, restored_model_sharded)
-            nnx.update(optimizer, restored_opt_sharded)
-
-            start_step = restored['step']
-
-            # 5. Re-split after restoring so the training loop gets the updated, fully sharded state!
-            graphdef, state = nnx.split((model, optimizer))
+            state = jax.tree_util.tree_map(replicate_all, state)
 
     # 6. Define the GSPMD Training Step (The Pure NNX Way)
     @jax.jit
