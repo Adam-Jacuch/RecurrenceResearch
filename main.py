@@ -100,28 +100,39 @@ def main():
     if not args.reset and mngr.latest_step() is not None:
         print(f"Found existing checkpoint at step {mngr.latest_step()}. Resuming...")
 
-        # 1. Get pure state pytrees. Because they were created inside the mesh,
-        # they inherently possess the correct 8-core sharding properties!
-        empty_model_state = nnx.state(model)
-        empty_opt_state = nnx.state(optimizer)
+        with mesh:
+            # 1. Capture the pristine 8-core states
+            empty_model_state = nnx.state(model)
+            empty_opt_state = nnx.state(optimizer)
 
-        restored = mngr.restore(
-            mngr.latest_step(),
-            args=ocp.args.Composite(
-                model=ocp.args.StandardRestore(empty_model_state),
-                optimizer=ocp.args.StandardRestore(empty_opt_state),
-                step=ocp.args.JsonRestore()
+            # 2. Let Orbax load the raw data (which will incorrectly put keys on Core 0)
+            restored = mngr.restore(
+                mngr.latest_step(),
+                args=ocp.args.Composite(
+                    model=ocp.args.StandardRestore(empty_model_state),
+                    optimizer=ocp.args.StandardRestore(empty_opt_state),
+                    step=ocp.args.JsonRestore()
+                )
             )
-        )
 
-        start_step = restored['step']
+            # 3. THE FIX: Bruteforce the 8-core shardings onto Orbax's loaded arrays
+            def enforce_sharding(restored_leaf, pristine_leaf):
+                # If the pristine model had a sharding rule for this leaf, FORCE the restored leaf to obey it
+                if hasattr(pristine_leaf, 'sharding'):
+                    return jax.device_put(restored_leaf, pristine_leaf.sharding)
+                return restored_leaf
 
-        # 2. Inject the natively sharded arrays back into our stateful NNX objects
-        nnx.update(model, restored['model'])
-        nnx.update(optimizer, restored['optimizer'])
+            restored_model_sharded = jax.tree.map(enforce_sharding, restored['model'], empty_model_state)
+            restored_opt_sharded = jax.tree.map(enforce_sharding, restored['optimizer'], empty_opt_state)
 
-        # 3. CRITICAL: Re-split after restoring so the training loop gets the updated state!
-        graphdef, state = nnx.split((model, optimizer))
+            # 4. Inject the brute-forced arrays back into our stateful NNX objects
+            nnx.update(model, restored_model_sharded)
+            nnx.update(optimizer, restored_opt_sharded)
+
+            start_step = restored['step']
+
+            # 5. Re-split after restoring so the training loop gets the updated state
+            graphdef, state = nnx.split((model, optimizer))
 
     # 6. Define the GSPMD Training Step (The Pure NNX Way)
     @jax.jit
