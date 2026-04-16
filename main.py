@@ -102,16 +102,27 @@ def main():
     start_step = 0
     if not args.reset and mngr.latest_step() is not None:
         print(f"Found existing checkpoint at step {mngr.latest_step()}. Resuming...")
-        mngr.restore(
+
+        # 1. Get pure state pytrees to act as the target structure for Orbax
+        empty_model_state = nnx.state(model)
+        empty_opt_state = nnx.state(optimizer)
+
+        restored = mngr.restore(
             mngr.latest_step(),
             args=ocp.args.Composite(
-                model=ocp.args.StandardRestore(model),
-                optimizer=ocp.args.StandardRestore(optimizer),
+                model=ocp.args.StandardRestore(empty_model_state),
+                optimizer=ocp.args.StandardRestore(empty_opt_state),
                 step=ocp.args.JsonRestore()
             )
         )
-        start_step = mngr.latest_step()
-        # CRITICAL: Re-split after restoring so the loop gets the updated state!
+
+        start_step = restored['step']
+
+        # 2. Inject the restored arrays back into our stateful NNX objects
+        nnx.update(model, restored['model'])
+        nnx.update(optimizer, restored['optimizer'])
+
+        # 3. CRITICAL: Re-split after restoring so the training loop gets the updated state!
         graphdef, state = nnx.split((model, optimizer))
 
     # 6. Define the GSPMD Training Step (The Pure NNX Way)
