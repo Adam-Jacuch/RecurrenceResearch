@@ -30,7 +30,7 @@ N_STEPS = 2
 GLOBAL_BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
 MAX_STEPS = 100_000
-EVAL_INTERVAL = 500
+EVAL_INTERVAL = 100
 SAVE_INTERVAL = 500
 
 
@@ -176,13 +176,9 @@ def main():
                     "step": step
                 })
 
-            # Checkpointing & Validation
-            if step % SAVE_INTERVAL == 0 and step > start_step:
-                print(f"Running evaluation & saving checkpoint to GCS at step {step}...")
-
-                # --- Validation Loop ---
+            # --- Validation Loop (High Frequency) ---
+            if step % EVAL_INTERVAL == 0 and step > start_step:
                 val_losses = []
-                # Run 10 batches of validation to get a stable mean
                 for _ in range(10):
                     val_batch = next(iter(val_loader))["input_ids"]
                     val_losses.append(val_step(graphdef, state, val_batch).item())
@@ -191,9 +187,10 @@ def main():
                 print(f"Step {step} | Val Loss: {val_loss_mean:.4f}")
                 run.log({"val/loss": val_loss_mean, "step": step})
 
-                # Merge back to save out
+            # --- Checkpointing (Low Frequency) ---
+            if step % SAVE_INTERVAL == 0 and step > start_step:
+                print(f"Saving checkpoint to GCS at step {step}...")
                 current_model, current_opt = nnx.merge(graphdef, state)
-
                 mngr.save(
                     step,
                     args=ocp.args.Composite(
