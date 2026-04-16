@@ -191,7 +191,7 @@ def main():
     # 9. The Training Loop
     print("Beginning training loop...")
     with mesh:
-        for step, batch in enumerate(train_loader, start=start_step):
+        for step, batch in enumerate(train_iterator, start=start_step):
             if step >= MAX_STEPS:
                 break
 
