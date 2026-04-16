@@ -205,8 +205,9 @@ def main():
                 mngr.save(
                     step,
                     args=ocp.args.Composite(
-                        model=ocp.args.StandardSave(current_model),
-                        optimizer=ocp.args.StandardSave(current_opt),
+                        # Extract pure states for Orbax!
+                        model=ocp.args.StandardSave(nnx.state(current_model)),
+                        optimizer=ocp.args.StandardSave(nnx.state(current_opt)),
                         step=ocp.args.JsonSave(step)
                     )
                 )
