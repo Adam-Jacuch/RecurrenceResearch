@@ -103,27 +103,29 @@ def main():
     if not args.reset and mngr.latest_step() is not None:
         print(f"Found existing checkpoint at step {mngr.latest_step()}. Resuming...")
 
-        # 1. Get pure state pytrees to act as the target structure for Orbax
-        empty_model_state = nnx.state(model)
-        empty_opt_state = nnx.state(optimizer)
+        # THE FIX: Wrap the restoration process inside the 8-core mesh!
+        with mesh:
+            # 1. Get pure state pytrees to act as the target structure for Orbax
+            empty_model_state = nnx.state(model)
+            empty_opt_state = nnx.state(optimizer)
 
-        restored = mngr.restore(
-            mngr.latest_step(),
-            args=ocp.args.Composite(
-                model=ocp.args.StandardRestore(empty_model_state),
-                optimizer=ocp.args.StandardRestore(empty_opt_state),
-                step=ocp.args.JsonRestore()
+            restored = mngr.restore(
+                mngr.latest_step(),
+                args=ocp.args.Composite(
+                    model=ocp.args.StandardRestore(empty_model_state),
+                    optimizer=ocp.args.StandardRestore(empty_opt_state),
+                    step=ocp.args.JsonRestore()
+                )
             )
-        )
 
-        start_step = restored['step']
+            start_step = restored['step']
 
-        # 2. Inject the restored arrays back into our stateful NNX objects
-        nnx.update(model, restored['model'])
-        nnx.update(optimizer, restored['optimizer'])
+            # 2. Inject the restored arrays back into our stateful NNX objects
+            nnx.update(model, restored['model'])
+            nnx.update(optimizer, restored['optimizer'])
 
-        # 3. CRITICAL: Re-split after restoring so the training loop gets the updated state!
-        graphdef, state = nnx.split((model, optimizer))
+            # 3. CRITICAL: Re-split after restoring so the training loop gets the updated state!
+            graphdef, state = nnx.split((model, optimizer))
 
     # 6. Define the GSPMD Training Step (The Pure NNX Way)
     @jax.jit
