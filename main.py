@@ -15,7 +15,6 @@ from loader import DistributedTPULoader
 from model import Model  # Your Axiom ResLM model
 
 # --- Configuration ---
-GCS_CHECKPOINT_DIR = "gs://adam-axiom-storage/checkpoints/reslm-180m"
 
 # Path defaults to /home/adam/datasets/... on the TPU Pod
 DATASET_PATH = "/home/adam/datasets/fineweb-edu-mistral-4096"
@@ -23,9 +22,9 @@ VAL_DATASET_PATH = "/home/adam/datasets/fineweb-edu-val-4096"
 
 # 180M Parameter Config
 VOCAB_SIZE = 32000
-DIM = 1024
+DIM = 1164
 DEPTH = 12
-N_STEPS = 2
+N_STEPS = 1
 
 GLOBAL_BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
@@ -38,7 +37,10 @@ def main():
     # --- COMMAND LINE ARGS ---
     parser = argparse.ArgumentParser(description="Train ResLM on Trillium")
     parser.add_argument("--reset", action="store_true", help="Start a fresh run, ignoring W&B and Checkpoints")
+    parser.add_argument("--run_id", type=str, required=True, help="Unique ID for W&B and GCS")
     args = parser.parse_args()
+
+    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage/checkpoints/reslm-180m/{args.run_id}"
 
     print(f"Initializing ResLM Training on {jax.device_count()} TPU cores...")
     if args.reset:
@@ -46,6 +48,8 @@ def main():
 
     # 1. Initialize W&B with Spot Preemption Resilience
     run = wandb.init(
+        id=args.run_id,
+        name=args.run_id,
         entity="adam-jacuch-stony-brook-university",
         project="reslm-neurips",
         config={
