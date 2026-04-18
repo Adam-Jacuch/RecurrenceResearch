@@ -10,29 +10,37 @@ class Recurrence(Module):
             return (alpha_j * x_i + x_j), (alpha_j * alpha_i)
         return x[..., ax.sq.assoc_scan(fn=linear_combine, inputs=(alpha,)), ax.d]
 
+
 class Step(Module):
     def __init__(self, step_idx: int = 0):
         self.step_idx = step_idx
         self.rec = Recurrence()
 
-    def __call__(self, v, ctx, out, alpha_logits):
+    def __call__(self, v, ctx, out, c):
+        # 1. The Pristine Token & The Refined Context
+        c_norm = c[..., ax.d.norm_rms()]
         ctx_norm = ctx[..., ax.d.norm_rms()]
 
-        bias_init = init.linspace(-2.0, 6.5) if self.step_idx == 0 else init.zeros
+        # 2. The Guarded Gate Input
+        gate_input = c_norm + ctx_norm
 
-        step_logits = ctx_norm[..., ax.d.proj(bias_init=bias_init)]
-        alpha_logits = alpha_logits + step_logits
-        alphas = alpha_logits[..., ax.d.sigmoid()]
+        # 3. Diverse Timescales for Sequential Steps
+        bias_init = init.linspace(-2.0, 6.5) if self.step_idx == 0 else init.linspace(0.0, 8.0)
 
-        betas = ctx_norm[..., ax.d.proj().silu()]
+        # 4. Clean, Un-collapsed Routing
+        alphas = gate_input[..., ax.d.proj(bias_init=bias_init).sigmoid()]
+        betas = gate_input[..., ax.d.proj().silu()]
+
         write_scale = (1.0 - alphas[..., ax.d.square()])[..., ax.d.clamp(min=1e-6).pow(0.5)]
-
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        ctx = ctx + fetched[..., ax.d.proj(kernel_init=init.zeros).silu()]
+        # 5. Variance-Bounded Residual Update (Zero-Init Identity)
+        update = fetched[..., ax.d.proj().silu().norm_rms(init_scale=init.zeros)]
+
+        ctx = ctx + update
         out = out + fetched
 
-        return v, ctx, out, alpha_logits
+        return v, ctx, out, c
 
 class Block(Module):
     def __init__(self, N: int) -> None:

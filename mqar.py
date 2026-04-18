@@ -258,19 +258,27 @@ if __name__ == "__main__":
 
     STEPS = 250_000
 
-    for task_name, conf in tasks.items():
-        for scale_name, configs in model_configs.items():
-            for dim, n in configs:
-                run_name = f"{task_name}_{scale_name}_N{n}_dim{dim}"
+    # 1. Define the Global Hardware Mesh
+    device_count = jax.device_count()
+    mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape((device_count,)), ('data',))
 
-                model = Model(vocab=conf.vocab_size, dim=dim, depth=4, N=n, dropout=0.0)
+    # Define sharded batch axis using Axiom semantic sharding
+    ax.b = ax.b(32).shard("data")  # Default batch size is 32
 
-                dummy_x = tensor(jnp.ones((1, conf.seq_len), dtype=jnp.int32), ax.b, ax.sq)
-                _ = model(dummy_x, use_checkpointing=False)
+    with mesh:
+        for task_name, conf in tasks.items():
+            for scale_name, configs in model_configs.items():
+                for dim, n in configs:
+                    run_name = f"{task_name}_{scale_name}_N{n}_dim{dim}"
 
-                train_and_log(steps=STEPS, model_name=run_name, model=model, config=conf)
+                    model = Model(vocab=conf.vocab_size, dim=dim, depth=4, N=n, dropout=0.0)
 
-                del model
-                dummy_x = None
-                gc.collect()
-                jax.clear_caches()
+                    dummy_x = tensor(jnp.ones((1, conf.seq_len), dtype=jnp.int32), ax.b, ax.sq)
+                    _ = model(dummy_x, use_checkpointing=False)
+
+                    train_and_log(steps=STEPS, model_name=run_name, model=model, config=conf, batch_size=32)
+
+                    del model
+                    dummy_x = None
+                    gc.collect()
+                    jax.clear_caches()
