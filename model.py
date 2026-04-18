@@ -29,8 +29,8 @@ class Step(Module):
 
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        ctx = ctx + fetched
-        out = out + fetched[..., ax.d.proj(kernel_init=init.zeros).silu()]
+        ctx = ctx + fetched[..., ax.d.proj(kernel_init=init.zeros).silu()]
+        out = out + fetched
 
         return v, ctx, out, alpha_logits
 
@@ -41,7 +41,7 @@ class Block(Module):
 
     def __call__(self, x):
         c = x[..., ax.d.conv(4, over=ax.sq.causal(), groups="depthwise").silu()]
-        out_gate = x[..., ax.d.proj().silu()]
+        #out_gate = x[..., ax.d.proj().silu()]
 
         v = ctx = out = c
         alpha_logits = c.zeros_like()
@@ -49,7 +49,7 @@ class Block(Module):
         for step in self.steps:
             v, ctx, out, alpha_logits = step(v, ctx, out, alpha_logits)
 
-        out = out[..., ax.d.gate(tensor=out_gate)]
+        #out = out[..., ax.d.gate(tensor=out_gate)]
         return out[..., ax.d.norm_rms().proj(kernel_init=init.normal(1e-4)).silu()]
 
 class Layer(Module):
