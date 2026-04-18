@@ -24,12 +24,12 @@ class Step(Module):
         alpha_logits = alpha_logits + step_logits
         alphas = alpha_logits[..., ax.d.sigmoid()]
 
-        betas = ctx_norm[..., ax.d.proj().tanh()]
+        betas = ctx_norm[..., ax.d.proj().silu()]
         write_scale = (1.0 - alphas[..., ax.d.square()])[..., ax.d.clamp(min=1e-6).pow(0.5)]
 
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        ctx = ctx + fetched[..., ax.d.proj(kernel_init=init.zeros).silu()]
+        ctx = ctx + fetched[..., ax.d.proj(kernel_init=init.zeros).tanh()]
         out = out + fetched
 
         return v, ctx, out, alpha_logits
