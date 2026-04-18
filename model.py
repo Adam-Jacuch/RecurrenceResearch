@@ -20,16 +20,14 @@ class Step(Module):
 
         bias_init = init.linspace(-2.0, 6.5) if self.step_idx == 0 else init.zeros
 
-        step_logits = ctx_norm[..., ax.d.proj(bias_init=bias_init)]
-        alpha_logits = alpha_logits + step_logits
-        alphas = alpha_logits[..., ax.d.sigmoid()]
+        alphas = ctx_norm[..., ax.d.proj(bias_init=bias_init).sigmoid()]
 
         betas = ctx_norm[..., ax.d.proj().silu()]
         write_scale = (1.0 - alphas[..., ax.d.square()])[..., ax.d.clamp(min=1e-6).pow(0.5)]
 
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        ctx = ctx + fetched[..., ax.d.proj().silu().norm_rms(init_scale=init.zeros)]
+        ctx = ctx + fetched[..., ax.d.proj(kernel_init=init.zeros).silu()]
         out = out + fetched
 
         return v, ctx, out, alpha_logits
