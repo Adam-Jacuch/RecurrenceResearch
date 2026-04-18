@@ -29,7 +29,7 @@ class Step(Module):
 
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        ctx = ctx + fetched[..., ax.d.proj(kernel_init=init.zeros).tanh()]
+        ctx = ctx + fetched[..., ax.d.proj().silu().norm_rms(init_scale=init.zeros)]
         out = out + fetched
 
         return v, ctx, out, alpha_logits
