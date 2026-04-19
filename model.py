@@ -19,15 +19,18 @@ class Step(Module):
     def __call__(self, v, out, c, prev_fetched):
         c_norm = c[..., ax.d.norm_rms()]
 
-        # Step 0 looks only at the token.
-        # Step 1 looks at the token AND what Step 0 fetched.
+        # 1. The Gate Handoff & Trojan Horse Init
         if self.step_idx == 0:
             gate_input = c_norm
+            # Step 0 gets a vector of 1.0s (fully awake)
+            init_fn = init.ones
         else:
             prev_norm = prev_fetched[..., ax.d.norm_rms()]
             gate_input = c_norm + prev_norm
+            # Step 1 gets a vector of 0.0s (fully dormant)
+            init_fn = init.zeros
 
-        bias_init = init.linspace(-2.0, 6.5) if self.step_idx == 0 else init.linspace(0.0, 8.0)
+        bias_init = init.linspace(-2.0, 6.5)
 
         alphas = gate_input[..., ax.d.proj(bias_init=bias_init).sigmoid()]
         betas = gate_input[..., ax.d.proj().silu()]
@@ -35,9 +38,10 @@ class Step(Module):
         write_scale = (1.0 - alphas[..., ax.d.square()])[..., ax.d.clamp(min=1e-6).pow(0.5)]
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        out = out + fetched
+        # 2. Feature-wise Gating into the Residual Stream
+        fetched_gated = fetched[..., ax.d.gate(init_fn=init_fn)]
+        out = out + fetched_gated
 
-        # Hand 'fetched' directly to the next step, no shadow stream needed
         return v, out, c, fetched
 
 class Block(Module):
