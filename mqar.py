@@ -273,7 +273,7 @@ if __name__ == "__main__":
 
                     model = Model(vocab=conf.vocab_size, dim=dim, depth=4, N=n, dropout=0.0)
 
-                    dummy_x = tensor(jnp.ones((1, conf.seq_len), dtype=jnp.int32), ax.b, ax.sq)
+                    dummy_x = tensor(jnp.ones((1, conf.seq_len), dtype=jnp.int32), ax.b, ax.sq).apply_sharding()
                     _ = model(dummy_x, use_checkpointing=False)
 
                     train_and_log(steps=STEPS, model_name=run_name, model=model, config=conf, batch_size=32)
