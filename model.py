@@ -16,31 +16,29 @@ class Step(Module):
         self.step_idx = step_idx
         self.rec = Recurrence()
 
-    def __call__(self, v, ctx, out, c):
-        # 1. The Pristine Token & The Refined Context
+    def __call__(self, v, out, c, prev_fetched):
         c_norm = c[..., ax.d.norm_rms()]
-        ctx_norm = ctx[..., ax.d.norm_rms()]
 
-        # 2. The Guarded Gate Input
-        gate_input = c_norm + ctx_norm
+        # Step 0 looks only at the token.
+        # Step 1 looks at the token AND what Step 0 fetched.
+        if self.step_idx == 0:
+            gate_input = c_norm
+        else:
+            prev_norm = prev_fetched[..., ax.d.norm_rms()]
+            gate_input = c_norm + prev_norm
 
-        # 3. Diverse Timescales for Sequential Steps
         bias_init = init.linspace(-2.0, 6.5) if self.step_idx == 0 else init.linspace(0.0, 8.0)
 
-        # 4. Clean, Un-collapsed Routing
         alphas = gate_input[..., ax.d.proj(bias_init=bias_init).sigmoid()]
         betas = gate_input[..., ax.d.proj().silu()]
 
         write_scale = (1.0 - alphas[..., ax.d.square()])[..., ax.d.clamp(min=1e-6).pow(0.5)]
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        # 5. Variance-Bounded Residual Update (Zero-Init Identity)
-        update = fetched[..., ax.d.proj().silu().norm_rms(init_scale=init.zeros)]
-
-        ctx = ctx + update
         out = out + fetched
 
-        return v, ctx, out, c
+        # Hand 'fetched' directly to the next step, no shadow stream needed
+        return v, out, c, fetched
 
 class Block(Module):
     def __init__(self, N: int) -> None:
@@ -51,11 +49,12 @@ class Block(Module):
         c = x[..., ax.d.conv(4, over=ax.sq.causal(), groups="depthwise").silu()]
         out_gate = x[..., ax.d.proj().silu()]
 
-        v = ctx = out = c
-        alpha_logits = c.zeros_like()
+        v = out = c
+
+        prev_fetched = c.zeros_like()
 
         for step in self.steps:
-            v, ctx, out, alpha_logits = step(v, ctx, out, alpha_logits)
+            v, out, c, prev_fetched = step(v, out, c, prev_fetched)
 
         out = out[..., ax.d.gate(tensor=out_gate)]
         return out[..., ax.d.norm_rms().proj(kernel_init=init.normal(1e-4)).silu()]
