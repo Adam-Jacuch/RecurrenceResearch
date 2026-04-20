@@ -37,7 +37,7 @@ class Step(Module):
         write_scale = (1.0 - alphas[..., ax.d.square()])[..., ax.d.clamp(min=1e-6).pow(0.5)]
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        out = out + fetched[..., ax.d.gate(init=init_fn)]
+        out = out + fetched[..., ax.d.gate(init_fn=init_fn)]
 
         # Hand 'fetched' directly to the next step, no shadow stream needed
         return v, out, c, fetched
