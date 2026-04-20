@@ -28,7 +28,7 @@ class Step(Module):
             prev_norm = prev_fetched[..., ax.d.norm_rms()]
             gate_input = c_norm + prev_norm
 
-        bias_init = init.linspace(-2.0, 6.5)
+        bias_init = init.linspace(-2.0, 6.5) if self.step_idx == 0 else init.linspace(0.0, 8.0)
 
         alphas = gate_input[..., ax.d.proj(bias_init=bias_init).sigmoid()]
         betas = gate_input[..., ax.d.proj().silu()]
@@ -37,6 +37,7 @@ class Step(Module):
         fetched = self.rec(v * betas * write_scale, alphas)
 
         out = out + fetched[..., ax.d.gate()]
+        v = v + fetched[..., ax.d.gate(init_fn=init.zeros)]
 
         # Hand 'fetched' directly to the next step, no shadow stream needed
         return v, out, c, fetched
