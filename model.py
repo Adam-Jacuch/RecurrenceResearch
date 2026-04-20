@@ -11,6 +11,7 @@ class Recurrence(Module):
         return x[..., ax.sq.assoc_scan(fn=linear_combine, inputs=(alpha,)), ax.d]
 
 
+
 class Step(Module):
     def __init__(self, step_idx: int = 0):
         self.step_idx = step_idx
@@ -23,11 +24,9 @@ class Step(Module):
         # Step 1 looks at the token AND what Step 0 fetched.
         if self.step_idx == 0:
             gate_input = c_norm
-            init_fn = init.ones
         else:
             prev_norm = prev_fetched[..., ax.d.norm_rms()]
             gate_input = c_norm + prev_norm
-            init_fn = init.zeros
 
         bias_init = init.linspace(-2.0, 6.5)
 
@@ -37,7 +36,7 @@ class Step(Module):
         write_scale = (1.0 - alphas[..., ax.d.square()])[..., ax.d.clamp(min=1e-6).pow(0.5)]
         fetched = self.rec(v * betas * write_scale, alphas)
 
-        out = out + fetched[..., ax.d.gate(init_fn=init_fn)]
+        out = out + fetched[..., ax.d.gate()]
 
         # Hand 'fetched' directly to the next step, no shadow stream needed
         return v, out, c, fetched
