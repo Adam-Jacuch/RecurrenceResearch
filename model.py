@@ -13,19 +13,22 @@ class Recurrence(Module):
 
 
 class Step(Module):
-    def __init__(self):
+    def __init__(self, step_idx: int = 0):
+        self.step_idx = step_idx
         self.rec = Recurrence()
 
-    def __call__(self, v, out, c, prev_fetched, current_step: int):
+    def __call__(self, v, out, c, prev_fetched):
         c_norm = c[..., ax.d.norm_rms()]
-        prev_norm = prev_fetched[..., ax.d.norm_rms()]
 
-        if current_step == 0:
+        # Step 0 looks only at the token.
+        # Step 1 looks at the token AND what Step 0 fetched.
+        if self.step_idx == 0:
             gate_input = c_norm
         else:
+            prev_norm = prev_fetched[..., ax.d.norm_rms()]
             gate_input = c_norm + prev_norm
 
-        bias_init = init.linspace(-2.0, 6.5)
+        bias_init = init.linspace(-2.0, 6.5) if self.step_idx == 0 else init.linspace(0.0, 8.0)
 
         alphas = gate_input[..., ax.d.proj(bias_init=bias_init).sigmoid()]
         betas = gate_input[..., ax.d.proj().silu()]
@@ -34,13 +37,15 @@ class Step(Module):
         fetched = self.rec(v * betas * write_scale, alphas)
 
         out = out + fetched[..., ax.d.gate()]
+        v = v + fetched[..., ax.d.gate(init_fn=init.zeros)]
 
+        # Hand 'fetched' directly to the next step, no shadow stream needed
         return v, out, c, fetched
 
 class Block(Module):
     def __init__(self, N: int) -> None:
         self.N = N
-        self.step = Step()
+        self.steps = nnx.List(Step(step_idx=i) for i in range(N))
 
     def __call__(self, x):
         c = x[..., ax.d.conv(4, over=ax.sq.causal(), groups="depthwise").silu()]
@@ -50,8 +55,8 @@ class Block(Module):
 
         prev_fetched = c.zeros_like()
 
-        for i in range(self.N):
-            v, out, c, prev_fetched = self.step(v, out, c, prev_fetched, current_step=i)
+        for step in self.steps:
+            v, out, c, prev_fetched = step(v, out, c, prev_fetched)
 
         out = out[..., ax.d.gate(tensor=out_gate)]
         return out[..., ax.d.norm_rms().proj(kernel_init=init.normal(1e-4)).silu()]
