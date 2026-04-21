@@ -24,7 +24,7 @@ VAL_DATASET_PATH = "/home/adam/datasets/fineweb-edu-val-4096"
 VOCAB_SIZE = 32000
 DIM = 1500
 DEPTH = 8
-N_STEPS = 2
+N_STEPS = 1
 
 GLOBAL_BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
