@@ -34,6 +34,7 @@ class Step(Module):
         fetched = self.rec(v * betas * write_scale, alphas)
 
         out = out + fetched[..., ax.d.gate()]
+        v = v + fetched[..., ax.d.gate(init_fn=init.zeros)]
 
         return v, out, c, fetched
 
