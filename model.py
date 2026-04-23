@@ -18,7 +18,7 @@ class Step(Module):
 
     def __call__(self, v, out, c, prev_fetched, current_step: int):
         c_norm = c[..., ax.d.norm_rms()]
-        prev_norm = prev_fetched[..., ax.d.norm_rms().gate()]
+        prev_norm = prev_fetched[..., ax.d.norm_rms().gate(init_fn=init.zeros)]
 
         if current_step == 0:
             gate_input = c_norm
