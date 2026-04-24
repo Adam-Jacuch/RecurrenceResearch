@@ -40,7 +40,7 @@ def main():
     parser.add_argument("--run_id", type=str, required=True, help="Unique ID for W&B and GCS")
     args = parser.parse_args()
 
-    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage-europe/checkpoints/reslm-180m/{args.run_id}"
+    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage/checkpoints/reslm-180m/{args.run_id}"
 
     print(f"Initializing ResLM Training on {jax.device_count()} TPU cores...")
     if args.reset:
