@@ -113,8 +113,13 @@ def main():
         model_, optimizer_ = nnx.merge(graphdef, state)
 
         def loss_fn(m):
-            # Mamba2ForCausalLM expects (B, L)
-            logits = m(inputs).logits
+            outputs = m(inputs)
+
+            if isinstance(outputs, dict):
+                logits = outputs["logits"]
+            else:
+                logits = outputs.logits
+
             return optax.softmax_cross_entropy_with_integer_labels(logits, targets).mean()
 
         loss, grads = nnx.value_and_grad(loss_fn)(model_)
