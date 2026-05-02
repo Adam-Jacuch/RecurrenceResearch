@@ -30,6 +30,9 @@ def main():
     parser.add_argument("--reset", action="store_true", help="Start a fresh run")
     parser.add_argument("--run_id", type=str, required=True, help="Unique ID")
     parser.add_argument("--path", type=str, default="/home/adam/datasets/fineweb-edu-mistral-4096")
+
+    # MODIFICATION 1: Add N as an argparse argument for easy job launching
+    parser.add_argument("--N", type=int, default=1, help="Recursive Depth (N=1 is single-pass)")
     args = parser.parse_args()
 
     GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage/checkpoints/mamba2-baseline/{args.run_id}"
@@ -49,7 +52,8 @@ def main():
             num_hidden_layers=DEPTH,
             state_size=64,
             head_dim=64,
-            expand=2
+            expand=2,
+            recursive_depth=args.N  # MODIFICATION 2: Inject N into the model config
         )
         model = Mamba2ForCausalLM(cfg, rngs=nnx.Rngs(0))
 
@@ -115,7 +119,8 @@ def main():
         model_, optimizer_ = nnx.merge(graphdef, state)
 
         def loss_fn(m):
-            outputs = m(inputs)
+            # MODIFICATION 3: Explicitly enable gradient checkpointing to maintain O(L+N) scaling on TPUs
+            outputs = m(inputs, use_checkpointing=True)
 
             if isinstance(outputs, dict):
                 logits = outputs["logits"]
@@ -142,11 +147,12 @@ def main():
     wandb.init(
         project="reslm-neurips",
         id=args.run_id,
-        resume="allow" if not args.reset else None
+        resume="allow" if not args.reset else None,
+        config={"N": args.N, "depth": DEPTH, "dim": DIM}  # Track N in WandB
     )
     wandb.define_metric("*", step_metric="step")
 
-    print(f"🚀 Training Mamba-2 180M on FineWeb-Edu...")
+    print(f"🚀 Training Recursive Mamba-2 (N={args.N}) 180M on FineWeb-Edu...")
     with mesh:
         for step, batch in enumerate(train_iterator, start=start_step):
             if step >= MAX_STEPS: break
