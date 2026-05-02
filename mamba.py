@@ -8,6 +8,8 @@ import orbax.checkpoint as ocp
 import wandb
 from flax import nnx
 
+import gc
+
 # External Mamba-2 JAX implementation
 from mamba2_jax import Mamba2Config, Mamba2ForCausalLM
 from loader import DistributedTPULoader  # Your provided loader
@@ -158,19 +160,33 @@ def main():
 
             if step % SAVE_INTERVAL == 0 and step > start_step:
                 print(f"Saving checkpoint to GCS at step {step}...")
+
+                loss.block_until_ready()
+
                 m_, o_ = nnx.merge(graphdef, state)
+
+                # Copy checkpoint payload to host RAM before Orbax writes it.
+                # This is slower, but avoids Orbax keeping extra TPU HBM buffers alive.
+                model_state_to_save = jax.device_get(nnx.state(m_))
+                opt_state_to_save = jax.device_get(nnx.state(o_))
+
+                del m_, o_
+                gc.collect()
 
                 mngr.save(
                     step,
                     args=ocp.args.Composite(
-                        model=ocp.args.StandardSave(nnx.state(m_)),
-                        optimizer=ocp.args.StandardSave(nnx.state(o_)),
+                        model=ocp.args.StandardSave(model_state_to_save),
+                        optimizer=ocp.args.StandardSave(opt_state_to_save),
                         step=ocp.args.JsonSave(int(step)),
                     ),
                 )
 
-                # Critical: force Orbax to finish async GCS writes before continuing.
                 mngr.wait_until_finished()
+
+                del model_state_to_save, opt_state_to_save
+                gc.collect()
+
                 print(f"Checkpoint {step} committed.")
 
     print("Training complete.")
