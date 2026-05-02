@@ -23,6 +23,7 @@ LEARNING_RATE = 3e-4
 MAX_STEPS = 76_500
 SAVE_INTERVAL = 500
 EVAL_INTERVAL = 100
+VAL_DATASET_PATH = "/home/adam/datasets/fineweb-edu-val-4096"  # Restored as a constant
 
 
 def main():
@@ -30,12 +31,11 @@ def main():
     parser.add_argument("--reset", action="store_true", help="Start a fresh run")
     parser.add_argument("--run_id", type=str, required=True, help="Unique ID")
     parser.add_argument("--path", type=str, default="/home/adam/datasets/fineweb-edu-mistral-4096")
-
-    # MODIFICATION 1: Add N as an argparse argument for easy job launching
     parser.add_argument("--N", type=int, default=1, help="Recursive Depth (N=1 is single-pass)")
     args = parser.parse_args()
 
-    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage/checkpoints/mamba2-baseline/{args.run_id}"
+    # Configured for the Europe TPU!
+    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage-europe/checkpoints/mamba2-baseline/{args.run_id}"
 
     # 1. Hardware Mesh Setup
     device_count = jax.device_count()
@@ -53,7 +53,7 @@ def main():
             state_size=64,
             head_dim=64,
             expand=2,
-            recursive_depth=args.N  # MODIFICATION 2: Inject N into the model config
+            recursive_depth=args.N
         )
         model = Mamba2ForCausalLM(cfg, rngs=nnx.Rngs(0))
 
@@ -109,7 +109,6 @@ def main():
     # 6. Training Logic
     @jax.jit
     def train_step(graphdef, state, batch_np):
-        # FIX: Flatten the loader's 3D array into 2D before applying standard sharding
         batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
         inputs_jax = jax.device_put(batch_global, dp_sharding)
 
@@ -119,7 +118,6 @@ def main():
         model_, optimizer_ = nnx.merge(graphdef, state)
 
         def loss_fn(m):
-            # MODIFICATION 3: Explicitly enable gradient checkpointing to maintain O(L+N) scaling on TPUs
             outputs = m(inputs, use_checkpointing=True)
 
             if isinstance(outputs, dict):
@@ -134,8 +132,32 @@ def main():
 
         return nnx.state((model_, optimizer_)), loss
 
+    # --- Validation Step ---
+    @jax.jit
+    def val_step(graphdef, state, batch_np):
+        batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
+        inputs_jax = jax.device_put(batch_global, dp_sharding)
+
+        inputs = inputs_jax[:, :-1]
+        targets = inputs_jax[:, 1:]
+
+        model_, _ = nnx.merge(graphdef, state)
+
+        # Checkpointing is usually False for eval to speed it up,
+        # but if you hit OOM issues during eval, you can flip this back to True.
+        outputs = model_(inputs, use_checkpointing=False)
+
+        if isinstance(outputs, dict):
+            logits = outputs["logits"]
+        else:
+            logits = outputs.logits
+
+        return optax.softmax_cross_entropy_with_integer_labels(logits, targets).mean()
+
     # 7. Data Setup
     loader = DistributedTPULoader(args.path, GLOBAL_BATCH_SIZE)
+    val_loader = DistributedTPULoader(VAL_DATASET_PATH, GLOBAL_BATCH_SIZE)
+
     train_iterator = iter(loader)
 
     if start_step > 0:
@@ -148,7 +170,7 @@ def main():
         project="reslm-neurips",
         id=args.run_id,
         resume="allow" if not args.reset else None,
-        config={"N": args.N, "depth": DEPTH, "dim": DIM}  # Track N in WandB
+        config={"N": args.N, "depth": DEPTH, "dim": DIM}
     )
     wandb.define_metric("*", step_metric="step")
 
@@ -159,11 +181,32 @@ def main():
 
             state, loss = train_step(graphdef, state, batch["input_ids"])
 
-            if step % EVAL_INTERVAL == 0:
-                ppl = jnp.exp(loss)
-                wandb.log({"train/loss": loss.item(), "train/ppl": ppl.item(), "step": step})
-                print(f"Step {step} | Loss: {loss.item():.4f} | PPL: {ppl.item():.2f}")
+            # --- Training Logging ---
+            if step % 10 == 0:
+                wandb.log({"train/loss": loss.item(), "step": step})
 
+            # --- Validation Loop ---
+            if step % EVAL_INTERVAL == 0:
+                val_losses = []
+                for _ in range(10):  # Evaluate over 10 batches to get a stable mean
+                    val_batch = next(iter(val_loader))["input_ids"]
+                    val_losses.append(val_step(graphdef, state, val_batch).item())
+
+                val_loss_mean = np.mean(val_losses)
+                val_ppl = np.exp(val_loss_mean)
+                train_ppl = jnp.exp(loss)
+
+                print(
+                    f"Step {step} | Train Loss: {loss.item():.4f} (PPL: {train_ppl.item():.2f}) | Val Loss: {val_loss_mean:.4f} (PPL: {val_ppl:.2f})")
+
+                wandb.log({
+                    "val/loss": val_loss_mean,
+                    "val/ppl": val_ppl,
+                    "train/ppl": train_ppl.item(),
+                    "step": step
+                })
+
+            # --- Checkpointing ---
             if step % SAVE_INTERVAL == 0 and step > start_step:
                 print(f"Saving checkpoint to GCS at step {step}...")
 
@@ -172,7 +215,6 @@ def main():
                 m_, o_ = nnx.merge(graphdef, state)
 
                 # Copy checkpoint payload to host RAM before Orbax writes it.
-                # This is slower, but avoids Orbax keeping extra TPU HBM buffers alive.
                 model_state_to_save = jax.device_get(nnx.state(m_))
                 opt_state_to_save = jax.device_get(nnx.state(o_))
 
