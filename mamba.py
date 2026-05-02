@@ -159,11 +159,19 @@ def main():
             if step % SAVE_INTERVAL == 0 and step > start_step:
                 print(f"Saving checkpoint to GCS at step {step}...")
                 m_, o_ = nnx.merge(graphdef, state)
-                mngr.save(step, args=ocp.args.Composite(
-                    model=ocp.args.StandardSave(nnx.state(m_)),
-                    optimizer=ocp.args.StandardSave(nnx.state(o_)),
-                    step=ocp.args.JsonSave(step)
-                ))
+
+                mngr.save(
+                    step,
+                    args=ocp.args.Composite(
+                        model=ocp.args.StandardSave(nnx.state(m_)),
+                        optimizer=ocp.args.StandardSave(nnx.state(o_)),
+                        step=ocp.args.JsonSave(int(step)),
+                    ),
+                )
+
+                # Critical: force Orbax to finish async GCS writes before continuing.
+                mngr.wait_until_finished()
+                print(f"Checkpoint {step} committed.")
 
     print("Training complete.")
     mngr.wait_until_finished()
