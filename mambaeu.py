@@ -55,7 +55,7 @@ def main():
             expand=2,
             recursive_depth=args.N
         )
-        model = Mamba2ForCausalLM(cfg, rngs=nnx.Rngs(0))
+        model = Mamba2ForCausalLM(cfg, rngs=nnx.Rngs(1))
 
         schedule = optax.cosine_decay_schedule(LEARNING_RATE, MAX_STEPS, alpha=0.1)
         tx = optax.chain(
