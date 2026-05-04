@@ -35,7 +35,7 @@ def main():
     args = parser.parse_args()
 
     # Configured for the Europe TPU!
-    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage-europe/checkpoints/mamba2-baseline/{args.run_id}"
+    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage/checkpoints/mamba2-baseline/{args.run_id}"
 
     # 1. Hardware Mesh Setup
     device_count = jax.device_count()
