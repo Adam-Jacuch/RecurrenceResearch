@@ -1,6 +1,7 @@
-import time
 import argparse
+import gc
 import numpy as np
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -8,7 +9,12 @@ import orbax.checkpoint as ocp
 import wandb
 from flax import nnx
 
-import gc
+from jax.sharding import PartitionSpec as P
+
+try:
+    from jax.experimental.shard_map import shard_map
+except ImportError:
+    from jax import shard_map
 
 from recurrentgemma import jax as rg_jax
 from loader import DistributedTPULoader
@@ -16,7 +22,7 @@ from loader import DistributedTPULoader
 
 # --- Hyperparameters ---
 VOCAB_SIZE = 32000
-DIM = 1152
+DIM = 1132
 DEPTH = 8
 GLOBAL_BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
@@ -54,18 +60,40 @@ def main():
     )
     args = parser.parse_args()
 
-    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage-europe/checkpoints/hawk-baseline/{args.run_id}"
+    GCS_CHECKPOINT_DIR = (
+        f"gs://adam-axiom-storage-europe/checkpoints/hawk-baseline/{args.run_id}"
+    )
 
     # 1. Hardware Mesh Setup
     device_count = jax.device_count()
+
+    if GLOBAL_BATCH_SIZE % device_count != 0:
+        raise ValueError(
+            f"GLOBAL_BATCH_SIZE={GLOBAL_BATCH_SIZE} must be divisible by "
+            f"device_count={device_count}"
+        )
+
+    LOCAL_BATCH_SIZE = GLOBAL_BATCH_SIZE // device_count
+
+    print(f"JAX devices: {device_count}")
+    print(
+        f"Using data-parallel shard_map: "
+        f"global batch={GLOBAL_BATCH_SIZE}, local batch={LOCAL_BATCH_SIZE}"
+    )
+
     mesh = jax.sharding.Mesh(
         np.array(jax.devices()).reshape((device_count,)),
         ("data",),
     )
 
+    replicated_sharding = jax.sharding.NamedSharding(
+        mesh,
+        P(),
+    )
+
     dp_sharding = jax.sharding.NamedSharding(
         mesh,
-        jax.sharding.PartitionSpec("data", None),
+        P("data", None),
     )
 
     # 2. Model Initialization
@@ -160,13 +188,12 @@ def main():
 
         graphdef, state = nnx.split((model, optimizer))
 
-    # 5. Replicate model/optimizer state across cores
+    # 5. Replicate model/optimizer state across cores.
+    #
+    # Hawk/RecurrentGemma's recurrent layer uses a TPU Mosaic/Pallas kernel.
+    # Therefore the model call must happen inside shard_map so the Pallas kernel
+    # sees local per-device tensors rather than automatically partitioned tensors.
     with mesh:
-        replicated_sharding = jax.sharding.NamedSharding(
-            mesh,
-            jax.sharding.PartitionSpec(),
-        )
-
         def replicate_all(x):
             if isinstance(x, jax.Array):
                 return jax.device_put(x, replicated_sharding)
@@ -175,13 +202,15 @@ def main():
         state = jax.tree_util.tree_map(replicate_all, state)
 
     # 6. Training Step
-    @jax.jit
-    def train_step(graphdef, state, batch_np):
-        batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
-        inputs_jax = jax.device_put(batch_global, dp_sharding)
+    def train_step_impl(state, batch_global):
+        """
+        Runs on each data-parallel shard.
 
-        inputs = inputs_jax[:, :-1]
-        targets = inputs_jax[:, 1:]
+        batch_global is logically [GLOBAL_BATCH_SIZE, seq_len], but inside
+        shard_map each device sees only [LOCAL_BATCH_SIZE, seq_len].
+        """
+        inputs = batch_global[:, :-1]
+        targets = batch_global[:, 1:]
 
         seq_len = inputs.shape[1]
 
@@ -209,18 +238,41 @@ def main():
             return loss
 
         loss, grads = nnx.value_and_grad(loss_fn)(model_)
+
+        # Average gradients and loss across data-parallel replicas.
+        grads = jax.tree_util.tree_map(
+            lambda x: jax.lax.pmean(x, "data") if isinstance(x, jax.Array) else x,
+            grads,
+        )
+        loss = jax.lax.pmean(loss, "data")
+
         optimizer_.update(model_, grads)
 
         return nnx.state((model_, optimizer_)), loss
 
-    # 7. Validation Step
-    @jax.jit
-    def val_step(graphdef, state, batch_np):
-        batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
-        inputs_jax = jax.device_put(batch_global, dp_sharding)
+    train_step = jax.jit(
+        shard_map(
+            train_step_impl,
+            mesh=mesh,
+            in_specs=(
+                P(),              # replicated state
+                P("data", None),  # shard batch over data axis
+            ),
+            out_specs=(
+                P(),  # replicated updated state
+                P(),  # replicated scalar loss
+            ),
+            check_rep=False,
+        )
+    )
 
-        inputs = inputs_jax[:, :-1]
-        targets = inputs_jax[:, 1:]
+    # 7. Validation Step
+    def val_step_impl(state, batch_global):
+        """
+        Runs on each data-parallel shard.
+        """
+        inputs = batch_global[:, :-1]
+        targets = batch_global[:, 1:]
 
         seq_len = inputs.shape[1]
 
@@ -244,7 +296,22 @@ def main():
             targets,
         ).mean()
 
+        loss = jax.lax.pmean(loss, "data")
+
         return loss
+
+    val_step = jax.jit(
+        shard_map(
+            val_step_impl,
+            mesh=mesh,
+            in_specs=(
+                P(),              # replicated state
+                P("data", None),  # shard batch over data axis
+            ),
+            out_specs=P(),        # replicated scalar loss
+            check_rep=False,
+        )
+    )
 
     # 8. Data Setup
     loader = DistributedTPULoader(args.path, GLOBAL_BATCH_SIZE)
@@ -269,11 +336,14 @@ def main():
             "dim": DIM,
             "vocab_size": VOCAB_SIZE,
             "global_batch_size": GLOBAL_BATCH_SIZE,
+            "local_batch_size": LOCAL_BATCH_SIZE,
+            "device_count": device_count,
             "learning_rate": LEARNING_RATE,
             "max_steps": MAX_STEPS,
             "mlp_expanded_width": DIM * 3,
             "num_heads": 1,
             "block_type": "all_recurrent",
+            "parallelism": "data_parallel_shard_map",
         },
     )
 
@@ -287,12 +357,16 @@ def main():
             if step >= MAX_STEPS:
                 break
 
-            state, loss = train_step(graphdef, state, batch["input_ids"])
+            batch_ids = batch["input_ids"].reshape(GLOBAL_BATCH_SIZE, -1)
+            batch_ids = jax.device_put(batch_ids, dp_sharding)
+
+            state, loss = train_step(state, batch_ids)
 
             if step % 10 == 0:
+                train_loss = float(jax.device_get(loss))
                 wandb.log(
                     {
-                        "train/loss": loss.item(),
+                        "train/loss": train_loss,
                         "step": step,
                     }
                 )
@@ -307,23 +381,25 @@ def main():
                         val_iterator = iter(val_loader)
                         val_batch = next(val_iterator)
 
-                    val_loss = val_step(
-                        graphdef,
-                        state,
-                        val_batch["input_ids"],
+                    val_batch_ids = val_batch["input_ids"].reshape(
+                        GLOBAL_BATCH_SIZE,
+                        -1,
                     )
+                    val_batch_ids = jax.device_put(val_batch_ids, dp_sharding)
 
-                    val_losses.append(val_loss.item())
+                    val_loss = val_step(state, val_batch_ids)
+                    val_losses.append(float(jax.device_get(val_loss)))
 
-                val_loss_mean = np.mean(val_losses)
-                val_ppl = np.exp(val_loss_mean)
+                val_loss_mean = float(np.mean(val_losses))
+                val_ppl = float(np.exp(val_loss_mean))
 
-                train_ppl = jnp.exp(loss)
+                train_loss = float(jax.device_get(loss))
+                train_ppl = float(np.exp(train_loss))
 
                 print(
                     f"Step {step} | "
-                    f"Train Loss: {loss.item():.4f} "
-                    f"(PPL: {train_ppl.item():.2f}) | "
+                    f"Train Loss: {train_loss:.4f} "
+                    f"(PPL: {train_ppl:.2f}) | "
                     f"Val Loss: {val_loss_mean:.4f} "
                     f"(PPL: {val_ppl:.2f})"
                 )
@@ -332,7 +408,7 @@ def main():
                     {
                         "val/loss": val_loss_mean,
                         "val/ppl": val_ppl,
-                        "train/ppl": train_ppl.item(),
+                        "train/ppl": train_ppl,
                         "step": step,
                     }
                 )
@@ -344,6 +420,7 @@ def main():
 
                 m_, o_ = nnx.merge(graphdef, state)
 
+                # Copy checkpoint payload to host RAM before Orbax writes it.
                 model_state_to_save = jax.device_get(nnx.state(m_))
                 opt_state_to_save = jax.device_get(nnx.state(o_))
 
