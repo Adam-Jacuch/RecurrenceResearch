@@ -12,11 +12,13 @@ dependencies = [
     "numpy",
     "wandb",
     "mamba2-jax",
+    "recurrentgemma",
 ]
 
 [tool.uv.sources]
 axiom = { git = "https://github.com/Adam-Jacuch/Axiom.git" }
 mamba2-jax = { git = "https://github.com/Adam-Jacuch/mamba2-jax-recurrence.git" }
+recurrentgemma = { git = "https://github.com/google-deepmind/recurrentgemma.git" }
 
 [dependency-groups]
 local = ["jax[cpu]"]
