@@ -95,6 +95,7 @@ def main():
         ).lazy_init(
             dummy_input,
             segment_pos=dummy_segment_pos,
+            return_cache=False,
         )
 
         params = nnx.state(model, nnx.Param)
@@ -195,6 +196,7 @@ def main():
             outputs = m(
                 inputs,
                 segment_pos=segment_pos,
+                return_cache=False,
             )
 
             logits = extract_logits(outputs)
@@ -232,6 +234,7 @@ def main():
         outputs = model_(
             inputs,
             segment_pos=segment_pos,
+            return_cache=False,
         )
 
         logits = extract_logits(outputs)
