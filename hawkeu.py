@@ -153,7 +153,7 @@ def main():
             ),
         )
 
-        start_step = restored["step"]
+        start_step = int(restored["step"])
 
         nnx.update(model, restored["model"])
         nnx.update(optimizer, restored["optimizer"])
