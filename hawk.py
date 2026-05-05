@@ -16,7 +16,7 @@ from loader import DistributedTPULoader
 
 # --- Hyperparameters ---
 VOCAB_SIZE = 32000
-DIM = 1152
+DIM = 1132
 DEPTH = 8
 GLOBAL_BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
