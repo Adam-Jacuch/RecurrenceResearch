@@ -31,7 +31,7 @@ VOCAB_SIZE = 32000
 # NOTE:
 # Your ResLM used DIM=1316, but attention needs DIM % HEADS == 0.
 # 1344 / 16 = 84, and this lands in roughly the same model-size neighborhood.
-DIM = 1064
+DIM = 1056
 DEPTH = 8
 HEADS = 8
 HEAD_DIM = DIM // HEADS
@@ -63,6 +63,53 @@ WANDB_PROJECT = "reslm-neurips"
 # Transformer model
 # =============================================================================
 
+ROPE_BASE = 10_000.0
+
+
+def apply_rope_bhsd(x, base: float = ROPE_BASE):
+    """
+    Apply RoPE to a raw JAX tensor with layout:
+
+        [batch, heads, seq, head_dim]
+
+    With DIM=1056 and HEADS=8, HEAD_DIM=132, so the whole head dimension
+    is rotated cleanly in pairs.
+    """
+    seq_len = x.shape[-2]
+    head_dim = x.shape[-1]
+
+    if head_dim % 2 != 0:
+        raise ValueError(
+            f"RoPE requires an even head_dim, got head_dim={head_dim}"
+        )
+
+    half = head_dim // 2
+
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+
+    inv_freq = 1.0 / (
+        base ** (
+            jnp.arange(0, half, dtype=jnp.float32) / float(half)
+        )
+    )
+
+    positions = jnp.arange(seq_len, dtype=jnp.float32)
+    freqs = positions[:, None] * inv_freq[None, :]
+
+    cos = jnp.cos(freqs).astype(x.dtype)
+    sin = jnp.sin(freqs).astype(x.dtype)
+
+    # Broadcast [seq, half] over [batch, heads, seq, half].
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+
+    y1 = x1 * cos - x2 * sin
+    y2 = x2 * cos + x1 * sin
+
+    return jnp.concatenate([y1, y2], axis=-1)
+
+
 class CausalSelfAttention(Module):
     def __init__(self) -> None:
         self.dim = DIM
@@ -78,9 +125,55 @@ class CausalSelfAttention(Module):
         v = x[..., (ax.sq >> ax.sk), ax.d.proj(out=head_block, use_bias=False)]
 
         # Unpack [h&dh] into explicit [h, dh].
-        q = q[ax.b, ax.sq, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sq, ax.dh]
-        k = k[ax.b, ax.sk, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sk, ax.dh]
-        v = v[ax.b, ax.sk, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sk, ax.dh]
+        q = q[
+            ax.b,
+            ax.sq,
+            ax.h(self.heads) & ax.dh,
+            "->",
+            ax.b,
+            ax.h,
+            ax.sq,
+            ax.dh,
+        ]
+
+        k = k[
+            ax.b,
+            ax.sk,
+            ax.h(self.heads) & ax.dh,
+            "->",
+            ax.b,
+            ax.h,
+            ax.sk,
+            ax.dh,
+        ]
+
+        v = v[
+            ax.b,
+            ax.sk,
+            ax.h(self.heads) & ax.dh,
+            "->",
+            ax.b,
+            ax.h,
+            ax.sk,
+            ax.dh,
+        ]
+
+        # RoPE on q/k only, before attention.
+        q = tensor(
+            apply_rope_bhsd(q.data),
+            ax.b,
+            ax.h,
+            ax.sq,
+            ax.dh,
+        )
+
+        k = tensor(
+            apply_rope_bhsd(k.data),
+            ax.b,
+            ax.h,
+            ax.sk,
+            ax.dh,
+        )
 
         if QK_NORM:
             q = q[..., ax.dh.norm_rms()]
@@ -157,7 +250,6 @@ class TransformerLM(Module):
             weight=w,
             use_bias=False,
         )]
-
 
 # =============================================================================
 # Helpers
