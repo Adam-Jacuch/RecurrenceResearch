@@ -1,122 +1,299 @@
-import time
+#!/usr/bin/env python3
+
+import os
+import math
 import argparse
-import numpy as np
+from functools import partial
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import wandb
 from flax import nnx
 
-import gc
-
-from recurrentgemma import jax as rg_jax
+from axiom import ax, Module, init, tensor
 from loader import DistributedTPULoader
 
 
-# --- Hyperparameters ---
-VOCAB_SIZE = 32000
-DIM = 1132
-DEPTH = 8
-GLOBAL_BATCH_SIZE = 32
-LEARNING_RATE = 3e-4
-MAX_STEPS = 76_500
-SAVE_INTERVAL = 500
-EVAL_INTERVAL = 100
+# =============================================================================
+# Hardcoded config
+# =============================================================================
+
+DATASET_PATH = "/home/adam/datasets/fineweb-edu-mistral-4096"
 VAL_DATASET_PATH = "/home/adam/datasets/fineweb-edu-val-4096"
 
+VOCAB_SIZE = 32000
 
-def extract_logits(outputs):
-    """
-    RecurrentGemma / bridge output format can vary slightly depending on version.
-    This keeps the training loop robust.
-    """
-    if isinstance(outputs, dict):
-        return outputs["logits"]
+# Transformer config.
+#
+# NOTE:
+# Your ResLM used DIM=1316, but attention needs DIM % HEADS == 0.
+# 1344 / 16 = 84, and this lands in roughly the same model-size neighborhood.
+DIM = 1064
+DEPTH = 8
+HEADS = 8
+HEAD_DIM = DIM // HEADS
 
-    if hasattr(outputs, "logits"):
-        return outputs.logits
+MLP_EXPANSION = 4
+DROPOUT = 0.0
+QK_NORM = False
 
-    if isinstance(outputs, tuple):
-        return outputs[0]
+GLOBAL_BATCH_SIZE = 32
 
-    return outputs
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-1
+MAX_STEPS = 76_500
+WARMUP_STEPS = 1_000
+GRAD_CLIP = 1.0
 
+EVAL_INTERVAL = 100
+EVAL_BATCHES = 10
+SAVE_INTERVAL = 500
+LOG_INTERVAL = 10
+
+USE_CHECKPOINTING = True
+
+WANDB_ENTITY = "adam-jacuch-stony-brook-university"
+WANDB_PROJECT = "reslm-neurips"
+
+
+# =============================================================================
+# Transformer model
+# =============================================================================
+
+class CausalSelfAttention(Module):
+    def __init__(self) -> None:
+        self.dim = DIM
+        self.heads = HEADS
+        self.head_dim = HEAD_DIM
+
+    def __call__(self, x):
+        head_block = ax.h(self.heads) & ax.dh(self.head_dim)
+
+        # Bias-free QKV, standard Transformer style.
+        q = x[..., ax.d.proj(out=head_block, use_bias=False)]
+        k = x[..., (ax.sq >> ax.sk), ax.d.proj(out=head_block, use_bias=False)]
+        v = x[..., (ax.sq >> ax.sk), ax.d.proj(out=head_block, use_bias=False)]
+
+        # Unpack [h&dh] into explicit [h, dh].
+        q = q[ax.b, ax.sq, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sq, ax.dh]
+        k = k[ax.b, ax.sk, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sk, ax.dh]
+        v = v[ax.b, ax.sk, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sk, ax.dh]
+
+        if QK_NORM:
+            q = q[..., ax.dh.norm_rms()]
+            k = k[..., ax.dh.norm_rms()]
+
+        # Axiom native causal attention.
+        ctx = q[..., ax.sq.attend(keys=k, values=v, dim=ax.dh, is_causal=True)]
+
+        # Repack heads and project back to residual dimension.
+        ctx = ctx[..., "->", ax.b, ax.sq, ax.h & ax.dh]
+        out = ctx[..., (ax.h & ax.dh).proj(out=ax.d(DIM), use_bias=False)]
+
+        if DROPOUT > 0.0:
+            out = out[..., ax.d.dropout(DROPOUT)]
+
+        return out
+
+
+class FeedForward(Module):
+    def __init__(self) -> None:
+        self.dim = DIM
+        self.expansion = MLP_EXPANSION
+
+    def __call__(self, x):
+        d = ax.d(DIM)
+
+        # SwiGLU halves the projected axis, so project to 2 * expansion * dim.
+        ff_in = ax.ff(DIM * MLP_EXPANSION * 2)
+
+        h = x[..., d.proj(out=ff_in).swiglu()]
+
+        # Small init on the residual projection, matching your ResLM style.
+        out = h[..., ax.ff.proj(out=d, kernel_init=init.normal(1e-4))]
+
+        if DROPOUT > 0.0:
+            out = out[..., ax.d.dropout(DROPOUT)]
+
+        return out
+
+
+class TransformerBlock(Module):
+    def __init__(self) -> None:
+        self.attn = CausalSelfAttention()
+        self.ff = FeedForward()
+
+    def __call__(self, x):
+        x = x + self.attn(x[..., ax.d.norm_rms()])
+        x = x + self.ff(x[..., ax.d.norm_rms()])
+        return x
+
+
+class TransformerLM(Module):
+    def __init__(self) -> None:
+        self.layers = nnx.List(TransformerBlock() for _ in range(DEPTH))
+
+    def __call__(self, x, use_checkpointing: bool = False):
+        x, w = x.embed(
+            vocab=ax.v(VOCAB_SIZE),
+            out=ax.d(DIM),
+            return_weight=True,
+        )
+
+        if DROPOUT > 0.0:
+            x = x[..., ax.d.dropout(DROPOUT)]
+
+        for layer in self.layers:
+            x = nnx.remat(layer)(x) if use_checkpointing else layer(x)
+
+        x = x[..., ax.d.norm_rms()]
+
+        # Tied readout.
+        return x[..., ax.d.proj(
+            out=ax.v(VOCAB_SIZE),
+            weight=w,
+            use_bias=False,
+        )]
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def count_params(model) -> int:
+    params = nnx.state(model, nnx.Param)
+    leaves = jax.tree_util.tree_leaves(params)
+    return int(sum(x.size for x in leaves if hasattr(x, "size")))
+
+
+def replicate_all_state_to_mesh(state, mesh):
+    replicated_sharding = jax.sharding.NamedSharding(
+        mesh,
+        jax.sharding.PartitionSpec(),
+    )
+
+    def replicate_one(x):
+        if isinstance(x, jax.Array):
+            return jax.device_put(x, replicated_sharding)
+        return x
+
+    return jax.tree_util.tree_map(replicate_one, state)
+
+
+def make_restarting_iterator(loader):
+    iterator = iter(loader)
+
+    def get_next():
+        nonlocal iterator
+        try:
+            return next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            return next(iterator)
+
+    return get_next
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Hawk Baseline on Trillium Europe")
-    parser.add_argument("--reset", action="store_true", help="Start a fresh run")
-    parser.add_argument("--run_id", type=str, required=True, help="Unique ID")
-    parser.add_argument(
-        "--path",
-        type=str,
-        default="/home/adam/datasets/fineweb-edu-mistral-4096",
-    )
+    parser = argparse.ArgumentParser(description="Train hardcoded Axiom Transformer LM")
+    parser.add_argument("--run_id", type=str, required=True)
+    parser.add_argument("--reset", action="store_true")
     args = parser.parse_args()
 
-    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage-europe/checkpoints/hawk-baseline/{args.run_id}"
+    if DIM % HEADS != 0:
+        raise ValueError(f"DIM={DIM} must be divisible by HEADS={HEADS}")
 
-    # 1. Hardware Mesh Setup
+    GCS_CHECKPOINT_DIR = f"gs://adam-axiom-storage-europe/checkpoints/axiom-transformer/{args.run_id}"
+
+    print(f"Initializing hardcoded Axiom Transformer on {jax.device_count()} TPU cores...")
+    print(f"Config: dim={DIM}, depth={DEPTH}, heads={HEADS}, head_dim={HEAD_DIM}")
+    print(f"Checkpoint dir: {GCS_CHECKPOINT_DIR}")
+
+    if args.reset:
+        print("WARNING: --reset flag detected. Starting a fresh run.")
+
+    run = wandb.init(
+        id=args.run_id,
+        name=args.run_id,
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        resume="allow" if not args.reset else None,
+        config={
+            "architecture": "Axiom Transformer",
+            "dataset": "FineWeb-Edu 10BT",
+            "vocab_size": VOCAB_SIZE,
+            "dim": DIM,
+            "depth": DEPTH,
+            "heads": HEADS,
+            "head_dim": HEAD_DIM,
+            "mlp_expansion": MLP_EXPANSION,
+            "dropout": DROPOUT,
+            "qk_norm": QK_NORM,
+            "global_batch_size": GLOBAL_BATCH_SIZE,
+            "lr": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "max_steps": MAX_STEPS,
+            "warmup_steps": WARMUP_STEPS,
+            "grad_clip": GRAD_CLIP,
+            "use_checkpointing": USE_CHECKPOINTING,
+        },
+    )
+
+    wandb.define_metric("*", step_metric="step")
+
     device_count = jax.device_count()
     mesh = jax.sharding.Mesh(
         np.array(jax.devices()).reshape((device_count,)),
         ("data",),
     )
 
-    dp_sharding = jax.sharding.NamedSharding(
-        mesh,
-        jax.sharding.PartitionSpec("data", None),
-    )
+    ax_b = ax.b(GLOBAL_BATCH_SIZE).shard("data")
 
-    # 2. Model Initialization
     with mesh:
-        print(f"Initializing Hawk (DIM={DIM}, DEPTH={DEPTH})...")
+        model = TransformerLM()
 
-        cfg = rg_jax.GriffinConfig(
-            vocab_size=VOCAB_SIZE,
-            width=DIM,
-            mlp_expanded_width=DIM * 3,
-            num_heads=1,
-            block_types=(rg_jax.TemporalBlockType.RECURRENT,) * DEPTH,
-            embeddings_scale_by_sqrt_dim=True,
-            attention_window_size=2048,
-            logits_soft_cap=30.0,
+        print("Materializing Axiom implicit parameters...")
+
+        dummy_batch = jnp.ones((GLOBAL_BATCH_SIZE, 16), dtype=jnp.int32)
+        dummy_tensor = tensor(dummy_batch, ax_b, ax.sq).apply_sharding()
+
+        _ = model(dummy_tensor, use_checkpointing=False)
+
+        param_count = count_params(model)
+        print(f"Parameter count: {param_count:,}")
+        run.log({"model/params": param_count, "step": 0})
+
+        warmup_schedule = optax.linear_schedule(
+            init_value=0.0,
+            end_value=LEARNING_RATE,
+            transition_steps=WARMUP_STEPS,
         )
 
-        # Keep False. Linen checkpointing can hide submodules from the NNX bridge.
-        linen_hawk = rg_jax.Griffin(cfg, gradient_checkpointing=False)
-
-        dummy_input = jnp.zeros((1, 128), dtype=jnp.int32)
-        dummy_segment_pos = jnp.arange(128, dtype=jnp.int32)[None, :]
-
-        model = nnx.bridge.ToNNX(
-            linen_hawk,
-            rngs=nnx.Rngs(1),
-        ).lazy_init(
-            dummy_input,
-            segment_pos=dummy_segment_pos,
-            return_cache=False,
-        )
-
-        params = nnx.state(model, nnx.Param)
-        total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
-
-        print("-" * 30)
-        print(f"Total Parameters: {total_params:,}")
-        print(f"Model Size:       {total_params / 1e6:.2f} M")
-        print("-" * 30)
-
-        schedule = optax.cosine_decay_schedule(
-            LEARNING_RATE,
-            MAX_STEPS,
+        cosine_schedule = optax.cosine_decay_schedule(
+            init_value=LEARNING_RATE,
+            decay_steps=max(MAX_STEPS - WARMUP_STEPS, 1),
             alpha=0.1,
         )
 
+        schedule = optax.join_schedules(
+            schedules=[warmup_schedule, cosine_schedule],
+            boundaries=[WARMUP_STEPS],
+        )
+
         tx = optax.chain(
-            optax.clip_by_global_norm(1.0),
+            optax.clip_by_global_norm(GRAD_CLIP),
             optax.adamw(
                 learning_rate=schedule,
-                weight_decay=0.1,
+                b1=0.9,
+                b2=0.95,
+                weight_decay=WEIGHT_DECAY,
             ),
         )
 
@@ -124,22 +301,19 @@ def main():
 
     graphdef, state = nnx.split((model, optimizer))
 
-    # 3. Setup Orbax
+    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+
     mngr = ocp.CheckpointManager(
         GCS_CHECKPOINT_DIR,
         item_names=("model", "optimizer", "step"),
-        options=ocp.CheckpointManagerOptions(
-            max_to_keep=2,
-            create=True,
-        ),
+        options=options,
     )
 
-    # 4. Resume Logic
     start_step = 0
 
     if not args.reset and mngr.latest_step() is not None:
         latest = mngr.latest_step()
-        print(f"Found existing checkpoint at step {latest}. Resuming...")
+        print(f"Found checkpoint at step {latest}. Restoring...")
 
         empty_model_state = nnx.state(model)
         empty_opt_state = nnx.state(optimizer)
@@ -160,179 +334,108 @@ def main():
 
         graphdef, state = nnx.split((model, optimizer))
 
-    # 5. Replicate model/optimizer state across cores
-    with mesh:
-        replicated_sharding = jax.sharding.NamedSharding(
-            mesh,
-            jax.sharding.PartitionSpec(),
-        )
+        with mesh:
+            state = replicate_all_state_to_mesh(state, mesh)
 
-        def replicate_all(x):
-            if isinstance(x, jax.Array):
-                return jax.device_put(x, replicated_sharding)
-            return x
+        print(f"Restored from checkpoint. start_step={start_step}")
 
-        state = jax.tree_util.tree_map(replicate_all, state)
-
-    # 6. Training Step
     @jax.jit
     def train_step(graphdef, state, batch_np):
         batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
-        inputs_jax = jax.device_put(batch_global, dp_sharding)
+        batch_tensor = tensor(batch_global, ax_b, ax.sq).apply_sharding()
 
-        inputs = inputs_jax[:, :-1]
-        targets = inputs_jax[:, 1:]
-
-        seq_len = inputs.shape[1]
-
-        segment_pos = jnp.broadcast_to(
-            jnp.arange(seq_len, dtype=jnp.int32)[None, :],
-            inputs.shape,
-        )
+        inputs = batch_tensor[..., ax.sq[:-1]]
+        targets = batch_tensor[..., ax.sq[1:]]
 
         model_, optimizer_ = nnx.merge(graphdef, state)
 
         def loss_fn(m):
-            outputs = m(
-                inputs,
-                segment_pos=segment_pos,
-                return_cache=False,
-            )
-
-            logits = extract_logits(outputs)
+            logits = m(inputs, use_checkpointing=USE_CHECKPOINTING).apply_sharding()
 
             loss = optax.softmax_cross_entropy_with_integer_labels(
-                logits,
-                targets,
+                logits.data,
+                targets.data,
             ).mean()
 
             return loss
 
         loss, grads = nnx.value_and_grad(loss_fn)(model_)
+
         optimizer_.update(model_, grads)
 
-        return nnx.state((model_, optimizer_)), loss
+        new_state = nnx.state((model_, optimizer_))
 
-    # 7. Validation Step
+        return new_state, loss
+
     @jax.jit
     def val_step(graphdef, state, batch_np):
         batch_global = batch_np.reshape(GLOBAL_BATCH_SIZE, -1)
-        inputs_jax = jax.device_put(batch_global, dp_sharding)
+        batch_tensor = tensor(batch_global, ax_b, ax.sq).apply_sharding()
 
-        inputs = inputs_jax[:, :-1]
-        targets = inputs_jax[:, 1:]
-
-        seq_len = inputs.shape[1]
-
-        segment_pos = jnp.broadcast_to(
-            jnp.arange(seq_len, dtype=jnp.int32)[None, :],
-            inputs.shape,
-        )
+        inputs = batch_tensor[..., ax.sq[:-1]]
+        targets = batch_tensor[..., ax.sq[1:]]
 
         model_, _ = nnx.merge(graphdef, state)
 
-        outputs = model_(
-            inputs,
-            segment_pos=segment_pos,
-            return_cache=False,
-        )
-
-        logits = extract_logits(outputs)
+        logits = model_(inputs, use_checkpointing=USE_CHECKPOINTING).apply_sharding()
 
         loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits,
-            targets,
+            logits.data,
+            targets.data,
         ).mean()
 
         return loss
 
-    # 8. Data Setup
-    loader = DistributedTPULoader(args.path, GLOBAL_BATCH_SIZE)
+    train_loader = DistributedTPULoader(DATASET_PATH, GLOBAL_BATCH_SIZE)
     val_loader = DistributedTPULoader(VAL_DATASET_PATH, GLOBAL_BATCH_SIZE)
 
-    train_iterator = iter(loader)
-    val_iterator = iter(val_loader)
+    next_train_batch = make_restarting_iterator(train_loader)
+    next_val_batch = make_restarting_iterator(val_loader)
 
     if start_step > 0:
-        print(f"Fast-forwarding dataloader by {start_step} batches...")
+        print(f"Fast-forwarding train loader by {start_step} batches...")
         for _ in range(start_step):
-            next(train_iterator)
+            _ = next_train_batch()
 
-    # 9. WandB
-    wandb.init(
-        project="reslm-neurips",
-        id=args.run_id,
-        resume="allow" if not args.reset else None,
-        config={
-            "model": "hawk",
-            "depth": DEPTH,
-            "dim": DIM,
-            "vocab_size": VOCAB_SIZE,
-            "global_batch_size": GLOBAL_BATCH_SIZE,
-            "learning_rate": LEARNING_RATE,
-            "max_steps": MAX_STEPS,
-            "mlp_expanded_width": DIM * 3,
-            "num_heads": 1,
-            "block_type": "all_recurrent",
-        },
-    )
+    print("Beginning training loop...")
 
-    wandb.define_metric("*", step_metric="step")
-
-    print(f"🚀 Training Hawk {total_params / 1e6:.2f}M on FineWeb-Edu...")
-
-    # 10. Training Loop
     with mesh:
-        for step, batch in enumerate(train_iterator, start=start_step):
-            if step >= MAX_STEPS:
-                break
+        for step in range(start_step, MAX_STEPS):
+            batch = next_train_batch()["input_ids"]
 
-            state, loss = train_step(graphdef, state, batch["input_ids"])
+            state, loss = train_step(graphdef, state, batch)
 
-            if step % 10 == 0:
-                wandb.log(
+            if step % LOG_INTERVAL == 0:
+                loss_f = float(loss.item())
+                ppl = math.exp(min(loss_f, 20.0))
+
+                print(f"Step {step} | Train Loss: {loss_f:.4f} | PPL: {ppl:.2f}")
+
+                run.log(
                     {
-                        "train/loss": loss.item(),
+                        "train/loss": loss_f,
+                        "train/perplexity": ppl,
                         "step": step,
                     }
                 )
 
-            if step % EVAL_INTERVAL == 0:
+            if step % EVAL_INTERVAL == 0 and step > start_step:
                 val_losses = []
 
-                for _ in range(10):
-                    try:
-                        val_batch = next(val_iterator)
-                    except StopIteration:
-                        val_iterator = iter(val_loader)
-                        val_batch = next(val_iterator)
+                for _ in range(EVAL_BATCHES):
+                    val_batch = next_val_batch()["input_ids"]
+                    val_loss = val_step(graphdef, state, val_batch)
+                    val_losses.append(float(val_loss.item()))
 
-                    val_loss = val_step(
-                        graphdef,
-                        state,
-                        val_batch["input_ids"],
-                    )
+                val_loss_mean = float(np.mean(val_losses))
+                val_ppl = math.exp(min(val_loss_mean, 20.0))
 
-                    val_losses.append(val_loss.item())
+                print(f"Step {step} | Val Loss: {val_loss_mean:.4f} | Val PPL: {val_ppl:.2f}")
 
-                val_loss_mean = np.mean(val_losses)
-                val_ppl = np.exp(val_loss_mean)
-
-                train_ppl = jnp.exp(loss)
-
-                print(
-                    f"Step {step} | "
-                    f"Train Loss: {loss.item():.4f} "
-                    f"(PPL: {train_ppl.item():.2f}) | "
-                    f"Val Loss: {val_loss_mean:.4f} "
-                    f"(PPL: {val_ppl:.2f})"
-                )
-
-                wandb.log(
+                run.log(
                     {
                         "val/loss": val_loss_mean,
-                        "val/ppl": val_ppl,
-                        "train/ppl": train_ppl.item(),
+                        "val/perplexity": val_ppl,
                         "step": step,
                     }
                 )
@@ -340,36 +443,21 @@ def main():
             if step % SAVE_INTERVAL == 0 and step > start_step:
                 print(f"Saving checkpoint to GCS at step {step}...")
 
-                loss.block_until_ready()
-
-                m_, o_ = nnx.merge(graphdef, state)
-
-                model_state_to_save = jax.device_get(nnx.state(m_))
-                opt_state_to_save = jax.device_get(nnx.state(o_))
-
-                del m_, o_
-                gc.collect()
+                current_model, current_opt = nnx.merge(graphdef, state)
 
                 mngr.save(
                     step,
                     args=ocp.args.Composite(
-                        model=ocp.args.StandardSave(model_state_to_save),
-                        optimizer=ocp.args.StandardSave(opt_state_to_save),
-                        step=ocp.args.JsonSave(int(step)),
+                        model=ocp.args.StandardSave(nnx.state(current_model)),
+                        optimizer=ocp.args.StandardSave(nnx.state(current_opt)),
+                        step=ocp.args.JsonSave(step),
                     ),
                 )
-
-                mngr.wait_until_finished()
-
-                del model_state_to_save, opt_state_to_save
-                gc.collect()
-
-                print(f"Checkpoint {step} committed.")
 
     print("Training complete.")
 
     mngr.wait_until_finished()
-    wandb.finish()
+    run.finish()
 
 
 if __name__ == "__main__":
